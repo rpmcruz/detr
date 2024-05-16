@@ -10,7 +10,7 @@ class DETR(torch.nn.Module):
     # https://github.com/facebookresearch/detr
     def __init__(self, num_classes, num_objects, hidden_dim=256, nheads=8, num_encoder_layers=6, num_decoder_layers=6):
         # num_classes: notice that class=0 is background (no-class)
-        # num_objects must be bigger than hidden features (32 for resnet50)
+        # num_objects must be bigger than hidden features (32 for resnet50, default is 100)
         super().__init__()
         self.conv = torch.nn.LazyConv2d(hidden_dim, 1)
         self.transformer = torch.nn.Transformer(hidden_dim, nheads, num_encoder_layers, num_decoder_layers, batch_first=True)
@@ -147,12 +147,11 @@ model_opt = torch.optim.AdamW(model.parameters(), 1e-4, weight_decay=1e-4)
 backbone_opt = torch.optim.AdamW(backbone.parameters(), 1e-5, weight_decay=1e-4)
 
 from time import time
-from tqdm import tqdm
 epochs = 300
 drop_lr_epoch = 200
 for epoch in range(epochs):
     tic = time()
-    for images, true_bboxes, true_classes in tqdm(ds):
+    for images, true_bboxes, true_classes in ds:
         images = images.to(device)
         true_bboxes = [t.to(device) for t in true_bboxes]
         true_classes = [t.to(device) for t in true_classes]
