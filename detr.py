@@ -176,7 +176,7 @@ for epoch in range(epochs):
     h, w = images[0].shape[1:]
     for (x1, y1, x2, y2), label in zip(true_bboxes[0].cpu(), true_classes[0].cpu()):
         plt.gca().add_patch(patches.Rectangle((x1*w, y1*h), (x2-x1)*w, (y2-y1)*h, linewidth=1, edgecolor='g', facecolor='none'))
-        plt.text(x1, y1, VOC.labels[label-1], c='g')
+        plt.text(x1*w, y1*h, VOC.labels[label-1], c='g')
     for (x1, y1, x2, y2), label, prob in zip(pred_bboxes[0].cpu().detach(), pred_classes[0].argmax(1).cpu().detach(), torch.softmax(pred_classes[0], 1).amax(1).cpu().detach()):
         if label == 0: continue
         plt.gca().add_patch(patches.Rectangle((x1*w, y1*h), (x2-x1)*w, (y2-y1)*h, linewidth=1, edgecolor='r', facecolor='none'))
