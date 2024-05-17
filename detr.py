@@ -97,8 +97,6 @@ def detr_loss(pred_bboxes, pred_classes, true_bboxes, true_classes):
 
 ########################################### DATASET ###########################################
 
-from torchvision.transforms import v2
-
 class VOC:
     labels = ['person', 'bird', 'cat', 'cow', 'dog', 'horse', 'sheep',
         'aeroplane', 'bicycle', 'boat', 'bus', 'car', 'motorbike', 'train',
@@ -106,29 +104,35 @@ class VOC:
     ]
     def __init__(self, root, train, transform):
         image_set = 'train' if train else 'val'
-        self.ds = torchvision.datasets.VOCDetection(root, image_set=image_set, transform=transform)
+        self.ds = torchvision.datasets.VOCDetection(root, image_set=image_set)
+        self.transform = transform
     def __len__(self):
         return len(self.ds)
     def __getitem__(self, i):
         image, xml = self.ds[i] 
         w = int(xml['annotation']['size']['width'])
         h = int(xml['annotation']['size']['height'])
-        bboxes = torch.tensor([(
-            int(object['bndbox']['xmin'])/w,
-            int(object['bndbox']['ymin'])/h,
-            int(object['bndbox']['xmax'])/w,
-            int(object['bndbox']['ymax'])/h,
-        ) for object in xml['annotation']['object']])
+        bboxes = torchvision.tv_tensors.BoundingBoxes(torch.tensor([(
+            float(object['bndbox']['xmin']), float(object['bndbox']['ymin']),
+            float(object['bndbox']['xmax']), float(object['bndbox']['ymax']),
+        ) for object in xml['annotation']['object']]), format='XYXY', canvas_size=(h, w))
         # note that classes start in 1 (0 is background)
         classes = torch.tensor([self.labels.index(object['name'])+1 for object in xml['annotation']['object']])
+        if self.transform:
+            image, bboxes = self.transform(image, bboxes)
+        # normalize bboxes to 0-1
+        bboxes[:, [0, 2]] = bboxes[:, [0, 2]] / bboxes.canvas_size[1]
+        bboxes[:, [1, 3]] = bboxes[:, [1, 3]] / bboxes.canvas_size[0]
         return image, bboxes, classes
 
 def my_collate(batch):
     return torch.stack([i[0] for i in batch], 0), [i[1] for i in batch], [i[2] for i in batch]
 
+from torchvision.transforms import v2
 aug = v2.Compose([
     v2.PILToTensor(),
-    v2.Resize((224, 224)),
+    v2.Resize((int(224*1.1), int(224*1.1))),
+    v2.RandomCrop((224, 224)),
     v2.RandomHorizontalFlip(),
     v2.ColorJitter(0.2, 0.2),
     v2.ToDtype(torch.float32, True),
@@ -139,19 +143,21 @@ ds = torch.utils.data.DataLoader(ds, 8, True, num_workers=4, pin_memory=True, co
 
 ########################################### TRAIN ###########################################
 
-# we keep backbone and the main model in separate to use different learning rates, like the paper
+# we instantiate the backbone and the main model separately to use different learning rates, like the paper
 backbone = Backbone().to(device)
 model = DETR(len(VOC.labels)+1, 32).to(device)
 model.train()
 model_opt = torch.optim.AdamW(model.parameters(), 1e-4, weight_decay=1e-4)
 backbone_opt = torch.optim.AdamW(backbone.parameters(), 1e-5, weight_decay=1e-4)
+model.backbone = backbone
 
 from time import time
+from tqdm import tqdm
 epochs = 300
 drop_lr_epoch = 200
 for epoch in range(epochs):
     tic = time()
-    for images, true_bboxes, true_classes in ds:
+    for images, true_bboxes, true_classes in tqdm(ds):
         images = images.to(device)
         true_bboxes = [t.to(device) for t in true_bboxes]
         true_classes = [t.to(device) for t in true_classes]
@@ -168,6 +174,7 @@ for epoch in range(epochs):
                 param_group['lr'] /= 10
     toc = time()
     print(f'Epoch {epoch+1}/{epochs} - {toc-tic:.0f}s - Loss: {loss}')
+    torch.save(model, 'model.pth', map_location='cpu')
     # evaluate
     import matplotlib.pyplot as plt
     from matplotlib import patches
@@ -182,4 +189,4 @@ for epoch in range(epochs):
         plt.gca().add_patch(patches.Rectangle((x1*w, y1*h), (x2-x1)*w, (y2-y1)*h, linewidth=1, edgecolor='r', facecolor='none'))
         plt.text(x1*w, y1*h, f'{VOC.labels[label-1]} {100*prob:.0f}%', c='r')
     plt.title(f'Epoch {epoch+1}')
-    plt.savefig('result.png')
+    plt.savefig(f'result-{epoch+1}.png')
