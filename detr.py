@@ -150,6 +150,7 @@ epochs = 300
 drop_lr_epoch = 200
 for epoch in range(epochs):
     tic = time()
+    avg_loss = 0
     for images, true_bboxes, true_classes in tqdm(ds):
         images = images.to(device)
         true_bboxes = [t.to(device) for t in true_bboxes]
@@ -161,12 +162,13 @@ for epoch in range(epochs):
         loss.backward()
         model_opt.step()
         backbone_opt.step()
+        avg_loss += float(loss) / len(ds)
     if epoch == drop_lr_epoch:
         for opt in [model_opt, backbone_opt]:
             for param_group in opt.param_groups:
                 param_group['lr'] /= 10
     toc = time()
-    print(f'Epoch {epoch+1}/{epochs} - {toc-tic:.0f}s - Loss: {loss}')
+    print(f'Epoch {epoch+1}/{epochs} - {toc-tic:.0f}s - Avg loss: {avg_loss}')
     torch.save(model, 'model.pth')
     # evaluate
     import matplotlib.pyplot as plt
