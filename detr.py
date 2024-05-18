@@ -1,4 +1,5 @@
 import torch, torchvision
+torch.set_float32_matmul_precision('high')
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 ########################################### MODEL ###########################################
@@ -8,7 +9,7 @@ def Backbone():
 
 class DETR(torch.nn.Module):
     # https://github.com/facebookresearch/detr
-    def __init__(self, num_classes, num_objects, hidden_dim=256, nheads=8, num_encoder_layers=6, num_decoder_layers=6):
+    def __init__(self, num_classes, hidden_dim=256, nheads=8, num_encoder_layers=6, num_decoder_layers=6):
         # num_classes: notice that class=0 is background (no-class)
         # num_objects must be bigger than hidden features (32 for resnet50, default is 100)
         super().__init__()
@@ -16,9 +17,9 @@ class DETR(torch.nn.Module):
         self.transformer = torch.nn.Transformer(hidden_dim, nheads, num_encoder_layers, num_decoder_layers, batch_first=True)
         self.classes = torch.nn.Linear(hidden_dim, num_classes)
         self.bboxes = torch.nn.Linear(hidden_dim, 4)
-        self.query_pos = torch.nn.Parameter(torch.rand(num_objects, hidden_dim))
-        self.row_embed = torch.nn.Parameter(torch.rand(num_objects//2, hidden_dim//2))
-        self.col_embed = torch.nn.Parameter(torch.rand(num_objects//2, hidden_dim//2))
+        self.query_pos = torch.nn.Parameter(torch.rand(100, hidden_dim))
+        self.row_embed = torch.nn.Parameter(torch.rand(100//2, hidden_dim//2))
+        self.col_embed = torch.nn.Parameter(torch.rand(100//2, hidden_dim//2))
         self.nheads = nheads
 
     def forward(self, x):
@@ -43,53 +44,45 @@ class DETR(torch.nn.Module):
 
 ########################################### LOSS ###########################################
 
-def detr_loss_per_batch(pred_bboxes, pred_classes, true_bboxes, true_classes):
+def detr_loss_per_batch(pred_bboxes: torch.Tensor, pred_classes: torch.Tensor, true_bboxes: torch.Tensor, true_classes: torch.Tensor):
     device = pred_bboxes.device
     lambda_iou = 5  # default parameter values from the paper
     lambda_l1 = 2
     # all loss permutations between predicted and true objects
-    # we need to also match predicted with no-object, a simple way to do that
-    # is by just adding those to the true objects.
-    # if for some reason there are more pred_bboxes than true_bboxes, only
-    # compute len(pred_bboxes) losses
-    n_true_bboxes = min(len(true_bboxes), len(pred_bboxes))
-    total_losses = torch.empty((len(pred_bboxes), 1+n_true_bboxes), device=device)
-    for i in range(len(pred_bboxes)):  # pred (i)
-        for j in range(n_true_bboxes):  # true (j))
-            loss_iou = torchvision.ops.generalized_box_iou_loss(pred_bboxes[i], true_bboxes[j])
-            loss_l1 = torch.mean(torch.abs(pred_bboxes[i] - true_bboxes[j]))
-            loss_class = torch.nn.functional.cross_entropy(pred_classes[i], true_classes[j])
-            loss_object = loss_class + lambda_iou*loss_iou + lambda_l1*loss_l1
-            total_losses[i, j] = loss_object
-        noobj = torch.zeros((), dtype=torch.int64, device=device)
-        loss_class = torch.nn.functional.cross_entropy(pred_classes[i], noobj)
-        total_losses[i, -1] = loss_class
+    # the last true bbox is the "no object"
+    n_pred = len(pred_bboxes)
+    n_true = 1 + min(len(true_bboxes), len(pred_bboxes))
+    # repeat preds and trues in a different fashion so they match
+    pred_bboxes = torch.repeat_interleave(pred_bboxes, n_true, 0)
+    pred_classes = torch.repeat_interleave(pred_classes, n_true, 0)
+    true_bboxes = torch.cat((true_bboxes, torch.zeros(1, 4, device=device)), 0).repeat(n_pred, 1)
+    true_classes = torch.cat((true_classes, torch.zeros(1, dtype=torch.int64, device=device)), 0).repeat(n_pred)
+    real_bboxes = torch.cat((torch.ones(n_true-1, device=device), torch.zeros(1, device=device))).repeat(n_pred)
+    # compute losses
+    loss_iou = torchvision.ops.generalized_box_iou_loss(pred_bboxes, true_bboxes, reduction='none')
+    loss_l1 = torch.mean(torch.abs(pred_bboxes - true_bboxes), 1)
+    loss_class = torch.nn.functional.cross_entropy(pred_classes, true_classes, reduction='none')
+    total_losses = loss_class + real_bboxes*(lambda_iou*loss_iou + lambda_l1*loss_l1)
+    total_losses = torch.reshape(total_losses, (n_pred, n_true))
     # Hungarian algorithm: find the minimum matches
     # quick and dirty solution
-    has_pred_matched = torch.zeros(len(pred_bboxes), dtype=torch.bool, device=device)
-    has_true_matched = torch.zeros(n_true_bboxes, dtype=torch.bool, device=device)
-    matches = []  # this list is just for debugging
     final_loss = 0
-    for _ in range(len(pred_bboxes)):
-        min_loss = float('inf')
-        ix = torch.arange(len(pred_bboxes), device=device)[~has_pred_matched]
-        for i in ix:
-            losses_i = total_losses[i]
-            if len(ix) <= (~has_true_matched).sum():
-                # if we still have true objects to match, focus on these objects
-                # i.e., exclude the no_objects
-                losses_i = losses_i[:-1]
-            loss, j = torch.min(losses_i, dim=0)
-            if loss < min_loss:
-                min_loss = loss
-                best_match = (i, j)
-        final_loss += min_loss
-        i, j = best_match
-        has_pred_matched[i] = True
-        if j < n_true_bboxes:
-            has_true_matched[j] = True
-            matches.append(i)
-    #print(matches)
+    no_objects_included = True
+    for _ in range(n_pred):
+        if no_objects_included and total_losses.shape[0] <= total_losses.shape[1]-1:
+            # if we still have true objects to match, focus on these objects
+            no_objects_included = False
+            total_losses = total_losses[:, :-1].contiguous()
+        loss, i = torch.min(total_losses.view(-1), dim=0)
+        final_loss += loss
+        # remove predicted row
+        pred_i = i // total_losses.shape[1]
+        total_losses = torch.cat((total_losses[:pred_i], total_losses[pred_i+1:]), 0)
+        # remove true column (only if not "no object")
+        true_i = i % total_losses.shape[1]
+        if not no_objects_included or true_i < total_losses.shape[1]-1:
+            total_losses = torch.cat((total_losses[:, :true_i], total_losses[:, true_i+1:]), 1)
+        total_losses = total_losses.contiguous()
     return final_loss
 
 def detr_loss(pred_bboxes, pred_classes, true_bboxes, true_classes):
@@ -145,7 +138,7 @@ ds = torch.utils.data.DataLoader(ds, 8, True, num_workers=4, pin_memory=True, co
 
 # we instantiate the backbone and the main model separately to use different learning rates, like the paper
 backbone = Backbone().to(device)
-model = DETR(len(VOC.labels)+1, 32).to(device)
+model = DETR(len(VOC.labels)+1).to(device)
 model.train()
 model_opt = torch.optim.AdamW(model.parameters(), 1e-4, weight_decay=1e-4)
 backbone_opt = torch.optim.AdamW(backbone.parameters(), 1e-5, weight_decay=1e-4)
@@ -174,7 +167,7 @@ for epoch in range(epochs):
                 param_group['lr'] /= 10
     toc = time()
     print(f'Epoch {epoch+1}/{epochs} - {toc-tic:.0f}s - Loss: {loss}')
-    torch.save(model, 'model.pth', map_location='cpu')
+    torch.save(model, 'model.pth')
     # evaluate
     import matplotlib.pyplot as plt
     from matplotlib import patches
