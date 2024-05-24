@@ -32,14 +32,8 @@ class DETR(torch.nn.Module):
         h = self.transformer(pos + h.flatten(2).permute(0, 2, 1), self.query_pos[None].repeat(N, 1, 1))
         # user should apply softmax
         classes = self.classes(h)
-        # predicted bounding boxes are in cxcywh format => convert to xyxy
+        # predicted bounding boxes are in cxcywh format
         bboxes = torch.sigmoid(self.bboxes(h))
-        bboxes = torch.stack((
-            bboxes[..., 0] - bboxes[..., 2]/2,
-            bboxes[..., 1] - bboxes[..., 3]/2,
-            bboxes[..., 0] + bboxes[..., 2]/2,
-            bboxes[..., 1] + bboxes[..., 3]/2,
-        ), -1)
         return bboxes, classes
 
 ########################################### LOSS ###########################################
@@ -59,29 +53,42 @@ def detr_loss_per_batch(pred_bboxes: torch.Tensor, pred_classes: torch.Tensor, t
     true_classes = torch.cat((true_classes, torch.zeros(1, dtype=torch.int64, device=device)), 0).repeat(n_pred)
     real_bboxes = torch.cat((torch.ones(n_true-1, device=device), torch.zeros(1, device=device))).repeat(n_pred)
     # compute losses
-    loss_iou = torchvision.ops.generalized_box_iou_loss(pred_bboxes, true_bboxes, reduction='none')
+    loss_iou = torchvision.ops.generalized_box_iou_loss(
+        torch.clamp(torchvision.ops.box_convert(pred_bboxes, 'cxcywh', 'xyxy'), 0, 1),
+        torch.clamp(torchvision.ops.box_convert(true_bboxes, 'cxcywh', 'xyxy'), 0, 1),
+        reduction='none')
     loss_l1 = torch.mean(torch.abs(pred_bboxes - true_bboxes), 1)
     loss_class = torch.nn.functional.cross_entropy(pred_classes, true_classes, reduction='none')
-    total_losses = loss_class + real_bboxes*(lambda_iou*loss_iou + lambda_l1*loss_l1)
+    # we also compute 'costs' because the paper uses a different L_match than L_Hungarian
+    with torch.no_grad():
+        probs = torch.nn.functional.softmax(pred_classes, 1)[range(len(pred_classes)), true_classes]
+        total_costs = -probs + real_bboxes*(lambda_iou*loss_iou + lambda_l1*loss_l1)
+        total_costs = torch.reshape(total_costs, (n_pred, n_true))
+    # we down-weight the log-probability term when ci=∅ by a factor 10 to account for class imbalance
+    total_losses = (1-real_bboxes)*loss_class/10 + real_bboxes*loss_class + real_bboxes*(lambda_iou*loss_iou + lambda_l1*loss_l1)
     total_losses = torch.reshape(total_losses, (n_pred, n_true))
     # Hungarian algorithm: find the minimum matches
     # quick and dirty solution
     final_loss = 0
     no_objects_included = True
     for _ in range(n_pred):
-        if no_objects_included and total_losses.shape[0] <= total_losses.shape[1]-1:
+        if no_objects_included and total_costs.shape[0] <= total_costs.shape[1]-1:
             # if we still have true objects to match, focus on these objects
             no_objects_included = False
+            total_costs = total_costs[:, :-1].contiguous()
             total_losses = total_losses[:, :-1].contiguous()
-        loss, i = torch.min(total_losses.view(-1), dim=0)
-        final_loss += loss
+        i = torch.argmin(total_costs.view(-1), dim=0)
+        final_loss += total_losses.view(-1)[i]
         # remove predicted row
-        pred_i = i // total_losses.shape[1]
+        pred_i = i // total_costs.shape[1]
+        total_costs = torch.cat((total_costs[:pred_i], total_costs[pred_i+1:]), 0)
         total_losses = torch.cat((total_losses[:pred_i], total_losses[pred_i+1:]), 0)
         # remove true column (only if not "no object")
-        true_i = i % total_losses.shape[1]
-        if not no_objects_included or true_i < total_losses.shape[1]-1:
+        true_i = i % total_costs.shape[1]
+        if not no_objects_included or true_i < total_costs.shape[1]-1:
+            total_costs = torch.cat((total_costs[:, :true_i], total_costs[:, true_i+1:]), 1)
             total_losses = torch.cat((total_losses[:, :true_i], total_losses[:, true_i+1:]), 1)
+        total_costs = total_costs.contiguous()
         total_losses = total_losses.contiguous()
     return final_loss
 
@@ -106,9 +113,11 @@ class VOC:
         w = int(xml['annotation']['size']['width'])
         h = int(xml['annotation']['size']['height'])
         bboxes = torchvision.tv_tensors.BoundingBoxes(torch.tensor([(
-            float(object['bndbox']['xmin']), float(object['bndbox']['ymin']),
-            float(object['bndbox']['xmax']), float(object['bndbox']['ymax']),
-        ) for object in xml['annotation']['object']]), format='XYXY', canvas_size=(h, w))
+            (float(object['bndbox']['xmin']) + float(object['bndbox']['xmax']))/2,
+            (float(object['bndbox']['ymin']) + float(object['bndbox']['ymax']))/2,
+            float(object['bndbox']['xmax']) - float(object['bndbox']['xmin']),
+            float(object['bndbox']['ymax']) - float(object['bndbox']['ymin']),
+        ) for object in xml['annotation']['object']]), format='CXCYWH', canvas_size=(h, w))
         # note that classes start in 1 (0 is background)
         classes = torch.tensor([self.labels.index(object['name'])+1 for object in xml['annotation']['object']])
         if self.transform:
@@ -151,6 +160,7 @@ drop_lr_epoch = 200
 for epoch in range(epochs):
     tic = time()
     avg_loss = 0
+    avg_bboxes = 0
     for images, true_bboxes, true_classes in tqdm(ds):
         images = images.to(device)
         true_bboxes = [t.to(device) for t in true_bboxes]
@@ -163,25 +173,26 @@ for epoch in range(epochs):
         model_opt.step()
         backbone_opt.step()
         avg_loss += float(loss) / len(ds)
+        avg_bboxes += float(torch.sum(pred_classes.argmax(-1) != 0)/len(pred_classes)) / len(ds)
     if epoch == drop_lr_epoch:
         for opt in [model_opt, backbone_opt]:
             for param_group in opt.param_groups:
                 param_group['lr'] /= 10
     toc = time()
-    print(f'Epoch {epoch+1}/{epochs} - {toc-tic:.0f}s - Avg loss: {avg_loss}')
+    print(f'Epoch {epoch+1}/{epochs} - {toc-tic:.0f}s - Avg loss: {avg_loss} - Avg bboxes: {avg_bboxes}')
     torch.save(model, 'model.pth')
     # evaluate
     import matplotlib.pyplot as plt
     from matplotlib import patches
     plt.clf()
     plt.imshow(images[0].permute(1, 2, 0).cpu())
-    h, w = images[0].shape[1:]
-    for (x1, y1, x2, y2), label in zip(true_bboxes[0].cpu(), true_classes[0].cpu()):
-        plt.gca().add_patch(patches.Rectangle((x1*w, y1*h), (x2-x1)*w, (y2-y1)*h, linewidth=1, edgecolor='g', facecolor='none'))
-        plt.text(x1*w, y1*h, VOC.labels[label-1], c='g')
-    for (x1, y1, x2, y2), label, prob in zip(pred_bboxes[0].cpu().detach(), pred_classes[0].argmax(1).cpu().detach(), torch.softmax(pred_classes[0], 1).amax(1).cpu().detach()):
+    H, W = images[0].shape[1:]
+    for (cx, cy, bw, bh), label in zip(true_bboxes[0].cpu(), true_classes[0].cpu()):
+        plt.gca().add_patch(patches.Rectangle(((cx-bw/2)*W, (cy-bh/2)*H), bw*W, bh*H, linewidth=1, edgecolor='g', facecolor='none'))
+        plt.text((cx-bw/2)*W, (cy-bh/2)*W, VOC.labels[label-1], c='g')
+    for (cx, cy, bw, bh), label, prob in zip(pred_bboxes[0].cpu().detach(), pred_classes[0].argmax(1).cpu().detach(), torch.softmax(pred_classes[0], 1).amax(1).cpu().detach()):
         if label == 0: continue
-        plt.gca().add_patch(patches.Rectangle((x1*w, y1*h), (x2-x1)*w, (y2-y1)*h, linewidth=1, edgecolor='r', facecolor='none'))
-        plt.text(x1*w, y1*h, f'{VOC.labels[label-1]} {100*prob:.0f}%', c='r')
+        plt.gca().add_patch(patches.Rectangle(((cx-bw/2)*W, (cy-bh/2)*H), bw*W, bh*H, linewidth=1, edgecolor='r', facecolor='none'))
+        plt.text((cx-bw/2)*W, (cy-bh/2)*W, f'{VOC.labels[label-1]} {100*prob:.0f}%', c='r')
     plt.title(f'Epoch {epoch+1}')
     plt.savefig(f'result-{epoch+1}.png')
